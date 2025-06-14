@@ -1,0 +1,80 @@
+/* Optional: Add custom CSS rules here if needed */
+
+/* Statistics bar styles */
+.stats-bar {
+    transition: box-shadow 0.2s ease; /* Removed background-color transition */
+    border: 1px solid #dbeafe; /* Light blue border */
+    box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05); /* Subtle shadow */
+}
+
+.stats-bar:hover {
+    box-shadow: 0 2px 4px 0 rgba(0, 0, 0, 0.08); /* Slightly larger shadow on hover */
+}
+
+/* Key cards container transition - smoother animation */
+.keys-grid {
+    overflow: hidden;
+    transition: max-height 0.5s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.3s ease-in-out;
+    max-height: 1000px; /* Set a reasonable max-height for transition */
+}
+
+/* Add specific style for hidden state for smoother transition */
+.keys-grid.hidden {
+    max-height: 0;
+    opacity: 0;
+    margin-top: 0; /* Avoid margin when hidden */
+    /* Ensure padding doesn't interfere when height is 0 */
+    padding-top: 0;
+    padding-bottom: 0;
+    /* Add delay to opacity transition to wait for height change */
+    transition: max-height 0.5s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.2s ease-in-out 0.1s;
+}
+
+
+/* Toggle icon transitions with rotation */
+.toggle-icon svg {
+    transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1); /* Smoother cubic-bezier */
+}
+
+/* Rotate expand icon when grid is collapsed (default state when hidden) */
+.stats-bar .expand-icon {
+    transform: rotate(0deg);
+}
+.stats-bar .collapse-icon {
+    transform: rotate(180deg);
+}
+/* No need for specific rules when hidden/shown, script handles swapping icons */
+
+
+/* Dark mode adjustments for statistics bar */
+body[data-theme="dark"] .stats-bar {
+    /* Removed background-color for dark mode */
+    color: #d1d5db !important; /* Adjusted dark text */
+    border-color: #4b5563 !important; /* Adjusted dark border */
+    box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.1); /* Slightly darker shadow */
+}
+
+body[data-theme="dark"] .stats-bar:hover {
+    box-shadow: 0 2px 4px 0 rgba(0, 0, 0, 0.15); /* Slightly darker hover shadow */
+}
+
+body[data-theme="dark"] .toggle-icon svg {
+    color: #9ca3af !important; /* Adjusted dark icon color */
+}
+
+/* Style for the individual key cards (optional improvements) */
+body[data-theme="dark"] .card-item {
+    background-color: #374151; /* Dark background for cards */
+    border-color: #4b5563;
+    color: #d1d5db;
+}
+body[data-theme="dark"] .card-item h3 {
+    color: #f3f4f6; /* Lighter heading in dark mode */
+}
+body[data-theme="dark"] .card-item p {
+    color: #9ca3af; /* Lighter secondary text */
+}
+body[data-theme="dark"] .card-item .bg-blue-100 {
+    background-color: #2563eb; /* Darker blue badge bg */
+    color: #eff6ff; /* Light text for badge */
+}

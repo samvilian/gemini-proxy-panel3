@@ -1,0 +1,11 @@
+version: '3.8' 
+services:
+  app:
+    image: dreamhartley705/gemini-proxy-panel:latest
+    container_name: gemini-proxy-panel
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/usr/src/app/data
