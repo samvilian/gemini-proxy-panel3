@@ -251,14 +251,15 @@ async function handleApiV1(request: Request, env: Env, ctx: ExecutionContext): P
 		});
 	}
 
-	if (pathname === '/v1/chat/completions') {
-		if (request.method === 'OPTIONS') {
-			return handleOptions(request);
-		}
+	if (pathname.startsWith('/v1/chat/completions')) {
 		return await handleV1ChatCompletions(request, env, ctx);
 	}
 
-	if (pathname === '/v1/models') {
+	if (pathname.startsWith('/v1/images/generations')) {
+		return await handleV1ImageGenerations(request, env, ctx);
+	}
+
+	if (pathname.startsWith('/v1/models')) {
 		return await handleV1Models(request, env, ctx);
 	}
 
@@ -2669,4 +2670,105 @@ async function readRequestBody<T>(request: Request): Promise<T | null> {
 		console.error("Error reading request body:", e);
 		return null;
 	}
+}
+
+async function handleV1ImageGenerations(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	console.log("Handling /v1/images/generations");
+
+	if (request.method !== 'POST') {
+		return new Response('Method Not Allowed', { status: 405 });
+	}
+
+	let requestBody: any;
+	try {
+		requestBody = await request.json();
+	} catch (e) {
+		return new Response(JSON.stringify({ error: "Invalid request body" }), { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders() } });
+	}
+
+	const { model: requestedModelId, prompt, n, size } = requestBody;
+
+	if (!requestedModelId || !prompt) {
+		return new Response(JSON.stringify({ error: "Missing 'model' or 'prompt' field" }), { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders() } });
+	}
+
+	const numberOfImages = n || 1;
+	// Note: Gemini's Imagen 2 doesn't support 'size' parameter directly like DALL-E. It's model-dependent.
+	// We will ignore 'size' for now but it could be used to select different models in the future.
+
+	let attempt = 1;
+	const MAX_RETRIES = 5; // Use a retry mechanism similar to chat completions
+
+	while (attempt <= MAX_RETRIES) {
+		let selectedKey: { id: string; key: string } | null = null;
+		try {
+			// Determine model category for key selection and quota
+			const modelCategory = 'Custom'; // Image models can be treated as 'Custom' category for quota purposes
+
+			selectedKey = await getNextAvailableGeminiKey(env, ctx, requestedModelId);
+
+			if (!selectedKey) {
+				return new Response(JSON.stringify({ error: "All keys are unavailable or have exceeded their quota." }), { status: 503, headers: corsHeaders() });
+			}
+
+			console.log(`Attempt ${attempt}: Proxying image generation for model: ${requestedModelId}, KeyID: ${selectedKey.id}`);
+
+			// Gemini Image Generation API endpoint
+			const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${requestedModelId}:generateImages?key=${selectedKey.key}`;
+
+			const geminiRequestBody = {
+				prompt: prompt,
+				number_of_images: numberOfImages,
+				// Add other parameters like negative_prompt, etc., if needed
+			};
+
+			const geminiResponse = await fetch(geminiUrl, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify(geminiRequestBody),
+			});
+
+			if (geminiResponse.ok) {
+				const geminiJson: any = await geminiResponse.json();
+
+				// Transform the response to OpenAI format
+				const openAIResponse = {
+					created: Math.floor(Date.now() / 1000),
+					data: geminiJson.images.map((img: any) => ({
+						// Assuming gemini returns base64 encoded images in a 'b64_json' or similar field
+						// This needs to be verified with actual Gemini API response for Imagen
+						b64_json: img.b64_json || '', // Adjust this based on actual response structure
+						revised_prompt: img.revised_prompt || undefined,
+					})),
+				};
+
+				ctx.waitUntil(incrementKeyUsage(selectedKey.id, env, requestedModelId, modelCategory, true));
+				return new Response(JSON.stringify(openAIResponse), { headers: { 'Content-Type': 'application/json', ...corsHeaders() } });
+			}
+
+			const errorBodyText = await geminiResponse.text();
+			console.error(`Attempt ${attempt}: Gemini Image API error: ${geminiResponse.status} ${geminiResponse.statusText}`, errorBodyText);
+
+			if (geminiResponse.status === 429) {
+				ctx.waitUntil(handle429Error(selectedKey.id, env, modelCategory as any, requestedModelId, errorBodyText));
+				if (attempt < MAX_RETRIES) continue;
+			} else if (geminiResponse.status === 401 || geminiResponse.status === 403) {
+				ctx.waitUntil(recordKeyError(selectedKey.id, env, geminiResponse.status as 401 | 403));
+			}
+
+			// For 400 or other non-retryable errors, break the loop and return the error
+			return new Response(errorBodyText, { status: geminiResponse.status, headers: corsHeaders() });
+
+		} catch (error) {
+			console.error(`Attempt ${attempt}: Error proxying image generation request:`, error);
+			if (attempt >= MAX_RETRIES) {
+				const errorMessage = error instanceof Error ? error.message : "An unexpected error occurred.";
+				return new Response(JSON.stringify({ error: errorMessage }), { status: 500, headers: corsHeaders() });
+			}
+		}
+
+		attempt++;
+	}
+
+	return new Response(JSON.stringify({ error: "Failed to process image generation request after multiple attempts." }), { status: 500, headers: corsHeaders() });
 }
