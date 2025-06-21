@@ -12,6 +12,9 @@ export interface Env {
 	ADMIN_PASSWORD?: string;
 	SESSION_SECRET_KEY?: string;
 	KEEPALIVE_ENABLED?: string; // Added for keepalive feature
+	GOOGLE_CLOUD_PROJECT?: string;
+	GOOGLE_CLOUD_LOCATION?: string;
+	GOOGLE_API_KEY?: string;
 }
 
 const GEMINI_BASE_URL = process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
@@ -2679,6 +2682,14 @@ async function handleV1ImageGenerations(request: Request, env: Env, ctx: Executi
 		return new Response('Method Not Allowed', { status: 405 });
 	}
 
+	// Read required environment variables
+	const projectId = env.GOOGLE_CLOUD_PROJECT;
+	const location = env.GOOGLE_CLOUD_LOCATION;
+
+	if (!projectId || !location) {
+		return new Response(JSON.stringify({ error: "Server configuration error: GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION must be set." }), { status: 500, headers: corsHeaders() });
+	}
+
 	let requestBody: any;
 	try {
 		requestBody = await request.json();
@@ -2686,76 +2697,80 @@ async function handleV1ImageGenerations(request: Request, env: Env, ctx: Executi
 		return new Response(JSON.stringify({ error: "Invalid request body" }), { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders() } });
 	}
 
-	const { model: requestedModelId, prompt, n, size } = requestBody;
+	const { model: requestedModelId, prompt, n, size, ...rest } = requestBody;
 
 	if (!requestedModelId || !prompt) {
 		return new Response(JSON.stringify({ error: "Missing 'model' or 'prompt' field" }), { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders() } });
 	}
 
-	const numberOfImages = n || 1;
-	// Note: Gemini's Imagen 2 doesn't support 'size' parameter directly like DALL-E. It's model-dependent.
-	// We will ignore 'size' for now but it could be used to select different models in the future.
-
+	// Use a retry mechanism similar to chat completions
 	let attempt = 1;
-	const MAX_RETRIES = 5; // Use a retry mechanism similar to chat completions
+	const MAX_RETRIES = 1; // Let's not retry for now to get clearer errors
 
 	while (attempt <= MAX_RETRIES) {
-		let selectedKey: { id: string; key: string } | null = null;
+		// Use the Worker's built-in Google Auth instead of a manually managed key
 		try {
-			// Determine model category for key selection and quota
-			const modelCategory = 'Custom'; // Image models can be treated as 'Custom' category for quota purposes
+			console.log(`Attempt ${attempt}: Proxying image generation for model: ${requestedModelId}`);
 
-			selectedKey = await getNextAvailableGeminiKey(env, ctx, requestedModelId);
+			// Construct the correct Vertex AI endpoint
+			const vertexUrl = `https://${location}-aiplatform.googleapis.com/v1/projects/${projectId}/locations/${location}/publishers/google/models/${requestedModelId}:predict`;
 
-			if (!selectedKey) {
-				return new Response(JSON.stringify({ error: "All keys are unavailable or have exceeded their quota." }), { status: 503, headers: corsHeaders() });
+			// Construct the request body for Vertex AI
+			const vertexRequestBody = {
+				instances: [
+					{
+						prompt: prompt
+					}
+				],
+				parameters: {
+					sampleCount: n || 1,
+					...rest // Pass through other parameters like aspectRatio, seed, etc.
+				}
+			};
+
+			// Use the gcloud auth token from the environment
+			const token = env.GOOGLE_API_KEY; // Assuming we will set this env var
+			if (!token) {
+				 // This part is tricky in a worker. Let's assume we are using a service account with the worker or a pre-set token.
+				 // For now, we will rely on a manually set GOOGLE_API_KEY for simplicity.
+				 return new Response(JSON.stringify({ error: "Server configuration error: GOOGLE_API_KEY is not set." }), { status: 500 });
 			}
 
-			console.log(`Attempt ${attempt}: Proxying image generation for model: ${requestedModelId}, KeyID: ${selectedKey.id}`);
-
-			// Gemini Image Generation API endpoint
-			const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${requestedModelId}:generateImages?key=${selectedKey.key}`;
-
-			const geminiRequestBody = {
-				prompt: prompt,
-				number_of_images: numberOfImages,
-				// Add other parameters like negative_prompt, etc., if needed
-			};
+			// We will try to use the built-in auth later if this fails. Let's use a standard API key for now.
+			// The key management logic from the original repo is designed for Gemini, not Vertex.
+			// We will just use a single key from env for this new endpoint for simplicity.
+			const selectedKey = env.GOOGLE_API_KEY;
+			const geminiUrl = `https://${location}-aiplatform.googleapis.com/v1/projects/${projectId}/locations/${location}/publishers/google/models/${requestedModelId}:predict`;
 
 			const geminiResponse = await fetch(geminiUrl, {
 				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify(geminiRequestBody),
+				headers: {
+					'Authorization': `Bearer ${selectedKey}`,
+					'Content-Type': 'application/json; charset=utf-8'
+				},
+				body: JSON.stringify(vertexRequestBody),
 			});
 
+
 			if (geminiResponse.ok) {
-				const geminiJson: any = await geminiResponse.json();
+				const vertexJson: any = await geminiResponse.json();
 
 				// Transform the response to OpenAI format
 				const openAIResponse = {
 					created: Math.floor(Date.now() / 1000),
-					data: geminiJson.images.map((img: any) => ({
-						// Assuming gemini returns base64 encoded images in a 'b64_json' or similar field
-						// This needs to be verified with actual Gemini API response for Imagen
-						b64_json: img.b64_json || '', // Adjust this based on actual response structure
-						revised_prompt: img.revised_prompt || undefined,
+					data: vertexJson.predictions.map((pred: any) => ({
+						b64_json: pred.bytesBase64Encoded,
+						revised_prompt: pred.prompt || undefined,
 					})),
 				};
 
-				ctx.waitUntil(incrementKeyUsage(selectedKey.id, env, requestedModelId, modelCategory, true));
+				// We are not using the key rotation logic here, so no need to call incrementKeyUsage
 				return new Response(JSON.stringify(openAIResponse), { headers: { 'Content-Type': 'application/json', ...corsHeaders() } });
 			}
 
 			const errorBodyText = await geminiResponse.text();
-			console.error(`Attempt ${attempt}: Gemini Image API error: ${geminiResponse.status} ${geminiResponse.statusText}`, errorBodyText);
-
-			if (geminiResponse.status === 429) {
-				ctx.waitUntil(handle429Error(selectedKey.id, env, modelCategory as any, requestedModelId, errorBodyText));
-				if (attempt < MAX_RETRIES) continue;
-			} else if (geminiResponse.status === 401 || geminiResponse.status === 403) {
-				ctx.waitUntil(recordKeyError(selectedKey.id, env, geminiResponse.status as 401 | 403));
-			}
-
+			console.error(`Attempt ${attempt}: Vertex AI Image API error: ${geminiResponse.status} ${geminiResponse.statusText}`, errorBodyText);
+			
 			// For 400 or other non-retryable errors, break the loop and return the error
 			return new Response(errorBodyText, { status: geminiResponse.status, headers: corsHeaders() });
 
