@@ -2717,7 +2717,6 @@ async function handleV1ImageGenerations(request: Request, env: Env, ctx: Executi
 					}
 				],
 				generationConfig: {
-					responseMimeType: "application/json",
 					responseModalities: ["TEXT", "IMAGE"]
 				}
 			};
