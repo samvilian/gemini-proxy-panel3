@@ -2682,14 +2682,6 @@ async function handleV1ImageGenerations(request: Request, env: Env, ctx: Executi
 		return new Response('Method Not Allowed', { status: 405 });
 	}
 
-	// Read required environment variables
-	const projectId = env.GOOGLE_CLOUD_PROJECT;
-	const location = env.GOOGLE_CLOUD_LOCATION;
-
-	if (!projectId || !location) {
-		return new Response(JSON.stringify({ error: "Server configuration error: GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION must be set." }), { status: 500, headers: corsHeaders() });
-	}
-
 	let requestBody: any;
 	try {
 		requestBody = await request.json();
@@ -2697,93 +2689,96 @@ async function handleV1ImageGenerations(request: Request, env: Env, ctx: Executi
 		return new Response(JSON.stringify({ error: "Invalid request body" }), { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders() } });
 	}
 
-	const { model: requestedModelId, prompt, n, size, ...rest } = requestBody;
-
+	const { model: requestedModelId, prompt, n } = requestBody;
 	if (!requestedModelId || !prompt) {
 		return new Response(JSON.stringify({ error: "Missing 'model' or 'prompt' field" }), { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders() } });
 	}
 
-	// Use a retry mechanism similar to chat completions
+	const MAX_RETRIES = 3;
 	let attempt = 1;
-	const MAX_RETRIES = 1; // Let's not retry for now to get clearer errors
-
 	while (attempt <= MAX_RETRIES) {
-		// Use the Worker's built-in Google Auth instead of a manually managed key
+		let selectedKey: { id: string; key: string } | null = null;
 		try {
-			console.log(`Attempt ${attempt}: Proxying image generation for model: ${requestedModelId}`);
+			// 使用现有的密钥轮询逻辑
+			selectedKey = await getNextAvailableGeminiKey(env, ctx, requestedModelId);
+			if (!selectedKey) {
+				return new Response(JSON.stringify({ error: "All keys are unavailable or have exceeded their quota." }), { status: 503, headers: corsHeaders() });
+			}
 
-			// Construct the correct Vertex AI endpoint
-			const vertexUrl = `https://${location}-aiplatform.googleapis.com/v1/projects/${projectId}/locations/${location}/publishers/google/models/${requestedModelId}:predict`;
+			console.log(`Attempt ${attempt}: Generating image with model ${requestedModelId}, KeyID: ${selectedKey.id}`);
 
-			// Construct the request body for Vertex AI
-			const vertexRequestBody = {
-				instances: [
+			const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${requestedModelId}:generateContent?key=${selectedKey.key}`;
+
+			const geminiRequestBody: any = {
+				contents: [
 					{
-						prompt: prompt
+						role: 'user',
+						parts: [{ text: prompt }]
 					}
 				],
-				parameters: {
-					sampleCount: n || 1,
-					...rest // Pass through other parameters like aspectRatio, seed, etc.
+				generationConfig: {
+					responseMimeType: "application/json",
+					responseModalities: ["TEXT", "IMAGE"]
 				}
 			};
 
-			// Use the gcloud auth token from the environment
-			const token = env.GOOGLE_API_KEY; // Assuming we will set this env var
-			if (!token) {
-				 // This part is tricky in a worker. Let's assume we are using a service account with the worker or a pre-set token.
-				 // For now, we will rely on a manually set GOOGLE_API_KEY for simplicity.
-				 return new Response(JSON.stringify({ error: "Server configuration error: GOOGLE_API_KEY is not set." }), { status: 500 });
-			}
-
-			// We will try to use the built-in auth later if this fails. Let's use a standard API key for now.
-			// The key management logic from the original repo is designed for Gemini, not Vertex.
-			// We will just use a single key from env for this new endpoint for simplicity.
-			const selectedKey = env.GOOGLE_API_KEY;
-			const geminiUrl = `https://${location}-aiplatform.googleapis.com/v1/projects/${projectId}/locations/${location}/publishers/google/models/${requestedModelId}:predict`;
-
 			const geminiResponse = await fetch(geminiUrl, {
 				method: 'POST',
-				headers: {
-					'Authorization': `Bearer ${selectedKey}`,
-					'Content-Type': 'application/json; charset=utf-8'
-				},
-				body: JSON.stringify(vertexRequestBody),
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify(geminiRequestBody)
 			});
 
-
 			if (geminiResponse.ok) {
-				const vertexJson: any = await geminiResponse.json();
+				const geminiJson: any = await geminiResponse.json();
 
-				// Transform the response to OpenAI format
+				// 解析返回的图像数据
+				let images: any[] = [];
+				try {
+					if (geminiJson.candidates && geminiJson.candidates.length > 0) {
+						const parts = geminiJson.candidates[0].content?.parts || [];
+						for (const p of parts) {
+							if (p.inlineData && p.inlineData.data) {
+								images.push({ b64_json: p.inlineData.data });
+							}
+						}
+					}
+				} catch (e) {
+					console.error('Error parsing image data:', e);
+				}
+
+				if (images.length === 0) {
+					return new Response(JSON.stringify({ error: "No image data returned from upstream" }), { status: 502, headers: corsHeaders() });
+				}
+
+				await incrementKeyUsage(selectedKey.id, env, requestedModelId, 'Custom', true);
+
 				const openAIResponse = {
 					created: Math.floor(Date.now() / 1000),
-					data: vertexJson.predictions.map((pred: any) => ({
-						b64_json: pred.bytesBase64Encoded,
-						revised_prompt: pred.prompt || undefined,
-					})),
+					data: images.slice(0, n || 1)
 				};
-
-				// We are not using the key rotation logic here, so no need to call incrementKeyUsage
 				return new Response(JSON.stringify(openAIResponse), { headers: { 'Content-Type': 'application/json', ...corsHeaders() } });
 			}
 
 			const errorBodyText = await geminiResponse.text();
-			console.error(`Attempt ${attempt}: Vertex AI Image API error: ${geminiResponse.status} ${geminiResponse.statusText}`, errorBodyText);
-			
-			// For 400 or other non-retryable errors, break the loop and return the error
+			console.error(`Attempt ${attempt}: Gemini Image API error ${geminiResponse.status}`, errorBodyText);
+
+			if (geminiResponse.status === 429) {
+				ctx.waitUntil(handle429Error(selectedKey.id, env, 'Custom' as any, requestedModelId, errorBodyText));
+				if (attempt < MAX_RETRIES) { attempt++; continue; }
+			} else if (geminiResponse.status === 401 || geminiResponse.status === 403) {
+				ctx.waitUntil(recordKeyError(selectedKey.id, env, geminiResponse.status as 401 | 403));
+			}
+
 			return new Response(errorBodyText, { status: geminiResponse.status, headers: corsHeaders() });
 
-		} catch (error) {
-			console.error(`Attempt ${attempt}: Error proxying image generation request:`, error);
+		} catch (err) {
+			console.error(`Attempt ${attempt}: Exception`, err);
 			if (attempt >= MAX_RETRIES) {
-				const errorMessage = error instanceof Error ? error.message : "An unexpected error occurred.";
-				return new Response(JSON.stringify({ error: errorMessage }), { status: 500, headers: corsHeaders() });
+				return new Response(JSON.stringify({ error: "Internal error" }), { status: 500, headers: corsHeaders() });
 			}
 		}
-
 		attempt++;
 	}
 
-	return new Response(JSON.stringify({ error: "Failed to process image generation request after multiple attempts." }), { status: 500, headers: corsHeaders() });
+	return new Response(JSON.stringify({ error: "Failed after retries" }), { status: 500, headers: corsHeaders() });
 }
