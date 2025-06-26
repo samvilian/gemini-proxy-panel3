@@ -64,6 +64,36 @@ function transformOpenAiToGemini(requestBody, requestedModelId, isSafetyEnabled 
                     return; // Skip adding this message to 'contents' when creating systemInstruction
                 }
                 break; // Break for 'system' role (safety disabled/gemma case falls through to content processing)
+			case 'tool':
+				role = 'user'; // Tool responses are treated as user messages in Gemini
+				try {
+					const toolName = msg.name; // OpenAI tool name
+					let toolOutput = msg.content;
+
+					// Attempt to parse content as JSON, if it's a string
+					if (typeof toolOutput === 'string') {
+						try {
+							toolOutput = JSON.parse(toolOutput);
+						} catch (e) {
+							console.warn(`Could not parse tool content as JSON for tool ${toolName}: ${msg.content}. Treating as string.`);
+							// If it's not valid JSON, wrap it in a simple object
+							toolOutput = { output: toolOutput };
+						}
+					} else if (toolOutput === undefined || toolOutput === null) {
+                        toolOutput = {}; // Ensure it's an object
+                    }
+
+					parts.push({
+						functionResponse: {
+							name: toolName,
+							response: toolOutput
+						}
+					});
+				} catch (e) {
+					console.error(`Error processing tool message: ${e.message}. Skipping message.`);
+					return; // Skip message if there's an error in processing
+				}
+				break;
 			default:
 				console.warn(`Unknown role encountered: ${msg.role}. Skipping message.`);
 				return; // Skip unknown roles
