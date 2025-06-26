@@ -323,6 +323,12 @@ function transformOpenAiToGemini(requestBody: any, requestedModelId?: string, is
 				role = 'user'; // Tool responses are treated as user messages in Gemini
 				try {
 					const toolName = msg.name; // OpenAI tool name
+
+					if (!toolName || typeof toolName !== 'string' || toolName.trim() === '') {
+						console.error(`Error: 'tool' message missing or empty 'name' field. Skipping message. Message:`, JSON.stringify(msg));
+						return; // Skip message if tool name is invalid
+					}
+
 					let toolOutput = msg.content;
 
 					// Attempt to parse content as JSON, if it's a string
