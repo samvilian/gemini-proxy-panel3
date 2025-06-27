@@ -23,6 +23,9 @@ function transformOpenAiToGemini(requestBody, requestedModelId, isSafetyEnabled 
 	const messages = requestBody.messages || [];
 	const openAiTools = requestBody.tools;
 
+	// 新增：记录已处理的 tool_call_id，防止死循环
+	const processedToolCallIds = new Set();
+
 	// 1. Transform Messages
 	const contents = [];
 	let systemInstruction = undefined;
@@ -67,13 +70,18 @@ function transformOpenAiToGemini(requestBody, requestedModelId, isSafetyEnabled 
 			case 'tool':
 				role = 'user'; // In Gemini, tool responses are part of the user's turn.
 				try {
-					// OpenAI uses 'tool_call_id', and we need to extract the function name for Gemini.
-					// The 'name' field is often missing in OpenAI tool messages.
 					const toolCallId = msg.tool_call_id;
 					if (!toolCallId) {
 						console.error("Error: 'tool' message is missing 'tool_call_id'. Skipping message.", msg);
 						return;
 					}
+
+					// 新增：去重逻辑
+					if (processedToolCallIds.has(toolCallId)) {
+						console.warn(`Duplicate tool_call_id detected: ${toolCallId}, skipping repeated tool message.`);
+						return;
+					}
+					processedToolCallIds.add(toolCallId);
 
 					// Extract the function name from the tool_call_id, assuming the format `call_FUNCNAME_...`
 					// This matches the format generated in `transformGeminiStreamChunk` and `transformGeminiResponseToOpenAI`.
