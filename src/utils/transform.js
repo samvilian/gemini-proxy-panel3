@@ -78,11 +78,11 @@ function transformOpenAiToGemini(requestBody, requestedModelId, isSafetyEnabled 
 					// Extract the function name from the tool_call_id, assuming the format `call_FUNCNAME_...`
 					// This matches the format generated in `transformGeminiStreamChunk` and `transformGeminiResponseToOpenAI`.
 					const match = toolCallId.match(/^call_([a-zA-Z0-9_-]+)_/);
-					const toolName = match ? match[1] : msg.name; // Fallback to msg.name if it exists
+					let toolName = match ? match[1] : msg.name; // Fallback to msg.name if it exists
 
 					if (!toolName) {
-						console.error(`Error: Could not extract function name from tool_call_id: ${toolCallId}. Skipping message.`);
-						return;
+						toolName = 'unknown_tool';
+						console.warn(`Warning: Could not extract function name from tool_call_id: ${toolCallId} and msg.name is missing. Using 'unknown_tool' as fallback.`);
 					}
 
 					let toolOutput = msg.content;
