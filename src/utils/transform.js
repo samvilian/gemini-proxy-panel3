@@ -65,9 +65,26 @@ function transformOpenAiToGemini(requestBody, requestedModelId, isSafetyEnabled 
                 }
                 break; // Break for 'system' role (safety disabled/gemma case falls through to content processing)
 			case 'tool':
-				role = 'user'; // Tool responses are treated as user messages in Gemini
+				role = 'user'; // In Gemini, tool responses are part of the user's turn.
 				try {
-					const toolName = msg.name; // OpenAI tool name
+					// OpenAI uses 'tool_call_id', and we need to extract the function name for Gemini.
+					// The 'name' field is often missing in OpenAI tool messages.
+					const toolCallId = msg.tool_call_id;
+					if (!toolCallId) {
+						console.error("Error: 'tool' message is missing 'tool_call_id'. Skipping message.", msg);
+						return;
+					}
+
+					// Extract the function name from the tool_call_id, assuming the format `call_FUNCNAME_...`
+					// This matches the format generated in `transformGeminiStreamChunk` and `transformGeminiResponseToOpenAI`.
+					const match = toolCallId.match(/^call_([a-zA-Z0-9_-]+)_/);
+					const toolName = match ? match[1] : msg.name; // Fallback to msg.name if it exists
+
+					if (!toolName) {
+						console.error(`Error: Could not extract function name from tool_call_id: ${toolCallId}. Skipping message.`);
+						return;
+					}
+
 					let toolOutput = msg.content;
 
 					// Attempt to parse content as JSON, if it's a string
@@ -75,23 +92,24 @@ function transformOpenAiToGemini(requestBody, requestedModelId, isSafetyEnabled 
 						try {
 							toolOutput = JSON.parse(toolOutput);
 						} catch (e) {
-							console.warn(`Could not parse tool content as JSON for tool ${toolName}: ${msg.content}. Treating as string.`);
-							// If it's not valid JSON, wrap it in a simple object
-							toolOutput = { output: toolOutput };
+							// It's common for tool content to be a simple string, not JSON.
+							// Gemini expects a JSON object for the 'response' field.
+							// console.warn(`Tool content for ${toolName} is not JSON: "${msg.content}". Wrapping it.`);
+							toolOutput = { content: toolOutput }; // Wrap the string content
 						}
 					} else if (toolOutput === undefined || toolOutput === null) {
-                        toolOutput = {}; // Ensure it's an object
-                    }
+						toolOutput = {}; // Ensure it's an object
+					}
 
 					parts.push({
 						functionResponse: {
 							name: toolName,
-							response: toolOutput
-						}
+							response: toolOutput,
+						},
 					});
 				} catch (e) {
 					console.error(`Error processing tool message: ${e.message}. Skipping message.`);
-					return; // Skip message if there's an error in processing
+					return; // Skip message on error
 				}
 				break;
 			default:
