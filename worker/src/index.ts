@@ -362,12 +362,10 @@ function transformOpenAiToGemini(requestBody: any, requestedModelId?: string, is
 		}
 
 		// 2. Map Content to Parts
-		// Handle text content
+		// Handle text and image content parts
 		if (typeof msg.content === 'string') {
 			parts.push({ text: msg.content });
-		}
-		// Handle image content (for user messages, mainly)
-		else if (Array.isArray(msg.content)) {
+		} else if (Array.isArray(msg.content)) {
 			msg.content.forEach((part: any) => {
 				if (part.type === 'text') {
 					parts.push({ text: part.text });
@@ -381,8 +379,9 @@ function transformOpenAiToGemini(requestBody: any, requestedModelId?: string, is
 				}
 			});
 		}
-		// Handle tool calls from assistant
-		else if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
+
+		// Handle tool calls from assistant, which can coexist with content
+		if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
 			msg.tool_calls.forEach((toolCall: any) => {
 				try {
 					parts.push({
@@ -397,10 +396,11 @@ function transformOpenAiToGemini(requestBody: any, requestedModelId?: string, is
 				}
 			});
 		}
-		// Handle null content, which is valid for tool_calls
-		else if (msg.content !== null) {
+
+		// Final check for unsupported content types, allowing for null content when tool_calls are present
+		if (parts.length === 0 && msg.content !== null) {
 			console.warn(`Unsupported content type for role ${msg.role}: ${typeof msg.content}. Skipping message.`);
-			return; // Skip only if content is not null and not a supported type
+			return;
 		}
 
 		// Add the transformed message to contents if it has a role and parts
