@@ -320,13 +320,22 @@ function transformOpenAiToGemini(requestBody: any, requestedModelId?: string, is
 				}
 				break; // Break for 'system' role (safety disabled/gemma case falls through to content processing)
 			case 'tool':
-				role = 'user'; // Tool responses are treated as user messages in Gemini
+				role = 'user'; // In Gemini, tool responses are part of the user's turn.
 				try {
-					const toolName = msg.name; // OpenAI tool name
+					const toolCallId = msg.tool_call_id;
+					if (!toolCallId) {
+						console.error("Error: 'tool' message is missing 'tool_call_id'. Skipping message.", msg);
+						return;
+					}
 
-					if (!toolName || typeof toolName !== 'string' || toolName.trim() === '') {
-						console.error(`Error: 'tool' message missing or empty 'name' field. Skipping message. Message:`, JSON.stringify(msg));
-						return; // Skip message if tool name is invalid
+					// Extract the function name from the tool_call_id.
+					// This relies on the convention `call_FUNCNAME_...` established during response transformation.
+					const match = toolCallId.match(/^call_([a-zA-Z0-9_-]+)_/);
+					let toolName = match ? match[1] : msg.name; // Fallback to msg.name for safety
+
+					if (!toolName) {
+						toolName = 'unknown_tool';
+						console.warn(`Warning: Could not extract function name from tool_call_id: ${toolCallId} and msg.name is missing. Using 'unknown_tool' as fallback.`);
 					}
 
 					let toolOutput = msg.content;
@@ -336,24 +345,24 @@ function transformOpenAiToGemini(requestBody: any, requestedModelId?: string, is
 						try {
 							toolOutput = JSON.parse(toolOutput);
 						} catch (e) {
-							console.warn(`Could not parse tool content as JSON for tool ${toolName}: ${msg.content}. Treating as string.`);
-							// If it's not valid JSON, wrap it in a simple object
-							toolOutput = { output: toolOutput };
+							// It's common for tool content to be a simple string, not JSON.
+							// Gemini expects a JSON object for the 'response' field, so we wrap it.
+							toolOutput = { content: toolOutput };
 						}
 					} else if (toolOutput === undefined || toolOutput === null) {
-                        toolOutput = {}; // Ensure it's an object
-                    }
+						toolOutput = {}; // Ensure it's an object
+					}
 
 					parts.push({
 						functionResponse: {
 							name: toolName,
-							response: toolOutput
-						}
+							response: toolOutput,
+						},
 					});
 				} catch (e) {
 					const errorMessage = e instanceof Error ? e.message : String(e);
 					console.error(`Error processing tool message: ${errorMessage}. Skipping message.`);
-					return; // Skip message if there's an error in processing
+					return; // Skip message on error
 				}
 				break;
 			default:
@@ -464,7 +473,7 @@ function transformGeminiStreamChunk(geminiChunk: any, modelId: string): string |
 			if (functionCallParts.length > 0) {
 				toolCalls = functionCallParts.map((part: any, index: number) => ({
 					index: index,
-					id: `call_${Date.now()}_${index}`,
+					id: `call_${part.functionCall.name}_${Date.now()}_${index}`,
 					type: "function",
 					function: {
 						name: part.functionCall.name,
@@ -640,7 +649,7 @@ function transformGeminiResponseToOpenAIObject(geminiResponse: any, modelId: str
 
 			if (functionCallParts.length > 0) {
 				toolCalls = functionCallParts.map((part: any, index: number) => ({
-					id: `call_${Date.now()}_${index}`,
+					id: `call_${part.functionCall.name}_${Date.now()}_${index}`,
 					type: "function",
 					function: {
 						name: part.functionCall.name,
