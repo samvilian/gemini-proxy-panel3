@@ -126,41 +126,49 @@ function transformOpenAiToGemini(requestBody, requestedModelId, isSafetyEnabled 
 		}
 
 		// 2. Map Content to Parts
+		// Handle text content
 		if (typeof msg.content === 'string') {
 			parts.push({ text: msg.content });
-		} else if (Array.isArray(msg.content)) {
-			// Handle multi-part messages (text and images)
+		}
+		// Handle image content (for user messages, mainly)
+		else if (Array.isArray(msg.content)) {
 			msg.content.forEach((part) => {
 				if (part.type === 'text') {
 					parts.push({ text: part.text });
 				} else if (part.type === 'image_url') {
-                    // In Node.js, image_url might just contain the URL, or a data URI
-                    // Assuming it follows the OpenAI spec and provides a URL field within image_url
-                    const imageUrl = part.image_url?.url;
-                    if (!imageUrl) {
-                        console.warn(`Missing url in image_url part. Skipping image part.`);
-                        return;
-                    }
-					const imageData = parseDataUri(imageUrl); // Attempt to parse as data URI
-					if (imageData) {
-						parts.push({ inlineData: { mimeType: imageData.mimeType, data: imageData.data } }); // Structure expected by Gemini
-					} else {
-                        // If it's not a data URI, we can't directly include it as inlineData.
-                        // Gemini API (currently) doesn't support fetching from URLs directly in the standard API.
-                        // Consider alternatives:
-                        // 1. Pre-fetch the image data server-side (adds complexity, requires fetch).
-                        // 2. Reject requests with image URLs (simpler for now).
-                        console.warn(`Image URL is not a data URI: ${imageUrl}. Gemini API requires inlineData (base64). Skipping image part.`);
-                        // Decide how to handle this. For now, we skip.
-                        // parts.push({ text: `[Unsupported Image URL: ${imageUrl}]` }); // Optional: replace with text placeholder
+					const imageUrl = part.image_url?.url;
+					if (!imageUrl) {
+						console.warn(`Missing url in image_url part. Skipping image part.`);
+						return;
 					}
-				} else {
-					console.warn(`Unknown content part type: ${part.type}. Skipping part.`);
+					const imageData = parseDataUri(imageUrl);
+					if (imageData) {
+						parts.push({ inlineData: { mimeType: imageData.mimeType, data: imageData.data } });
+					} else {
+						console.warn(`Image URL is not a data URI: ${imageUrl}. Gemini API requires inlineData. Skipping image part.`);
+					}
 				}
 			});
-		} else {
+		}
+		// Handle tool calls from assistant
+		else if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
+			msg.tool_calls.forEach(toolCall => {
+				try {
+					parts.push({
+						functionCall: {
+							name: toolCall.function.name,
+							args: JSON.parse(toolCall.function.arguments),
+						},
+					});
+				} catch (e) {
+					console.error(`Error parsing tool_call arguments for ${toolCall.function.name}: ${e.message}. Skipping tool call.`);
+				}
+			});
+		}
+		// Handle null content, which is valid for tool_calls
+		else if (msg.content !== null) {
 			console.warn(`Unsupported content type for role ${msg.role}: ${typeof msg.content}. Skipping message.`);
-			return;
+			return; // Skip only if content is not null and not a supported type
 		}
 
 		// Add the transformed message to contents if it has a role and parts

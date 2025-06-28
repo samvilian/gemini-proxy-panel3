@@ -351,7 +351,8 @@ function transformOpenAiToGemini(requestBody: any, requestedModelId?: string, is
 						}
 					});
 				} catch (e) {
-					console.error(`Error processing tool message: ${e.message}. Skipping message.`);
+					const errorMessage = e instanceof Error ? e.message : String(e);
+					console.error(`Error processing tool message: ${errorMessage}. Skipping message.`);
 					return; // Skip message if there's an error in processing
 				}
 				break;
@@ -360,11 +361,13 @@ function transformOpenAiToGemini(requestBody: any, requestedModelId?: string, is
 				return; // Skip unknown roles
 		}
 
-		// 2. Map Content to Parts (existing logic)
+		// 2. Map Content to Parts
+		// Handle text content
 		if (typeof msg.content === 'string') {
 			parts.push({ text: msg.content });
-		} else if (Array.isArray(msg.content)) {
-			// Handle multi-part messages (text and images)
+		}
+		// Handle image content (for user messages, mainly)
+		else if (Array.isArray(msg.content)) {
 			msg.content.forEach((part: any) => {
 				if (part.type === 'text') {
 					parts.push({ text: part.text });
@@ -375,13 +378,29 @@ function transformOpenAiToGemini(requestBody: any, requestedModelId?: string, is
 					} else {
 						console.warn(`Could not parse image_url: ${part.image_url?.url}. Skipping image part.`);
 					}
-				} else {
-					console.warn(`Unknown content part type: ${part.type}. Skipping part.`);
 				}
 			});
-		} else {
+		}
+		// Handle tool calls from assistant
+		else if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
+			msg.tool_calls.forEach((toolCall: any) => {
+				try {
+					parts.push({
+						functionCall: {
+							name: toolCall.function.name,
+							args: JSON.parse(toolCall.function.arguments),
+						},
+					});
+				} catch (e) {
+					const errorMessage = e instanceof Error ? e.message : String(e);
+					console.error(`Error parsing tool_call arguments for ${toolCall.function.name}: ${errorMessage}. Skipping tool call.`);
+				}
+			});
+		}
+		// Handle null content, which is valid for tool_calls
+		else if (msg.content !== null) {
 			console.warn(`Unsupported content type for role ${msg.role}: ${typeof msg.content}. Skipping message.`);
-			return;
+			return; // Skip only if content is not null and not a supported type
 		}
 
 		// Add the transformed message to contents if it has a role and parts
@@ -966,15 +985,15 @@ async function handleV1ChatCompletions(request: Request, env: Env, ctx: Executio
 
 					// --- KEEPALIVE MODE ---
 					if (useKeepAlive) {
-						const geminiJson = await geminiResponse.json(); // Get full response (since actualStreamMode was false)
+						const geminiJson: any = await geminiResponse.json(); // Get full response (since actualStreamMode was false)
 						console.log("Processing successful response in KEEPALIVE mode.");
 						
 						// Check if it's an empty response (finishReason is OTHER and no content)
-						const isEmptyResponse = geminiJson.candidates && 
-											  geminiJson.candidates[0] && 
-											  geminiJson.candidates[0].finishReason === "OTHER" && 
-											  (!geminiJson.candidates[0].content || 
-											   !geminiJson.candidates[0].content.parts || 
+						const isEmptyResponse = geminiJson.candidates &&
+											  geminiJson.candidates[0] &&
+											  geminiJson.candidates[0].finishReason === "OTHER" &&
+											  (!geminiJson.candidates[0].content ||
+											   !geminiJson.candidates[0].content.parts ||
 											   geminiJson.candidates[0].content.parts.length === 0);
 						
 						if (isEmptyResponse && attempt < MAX_RETRIES) {
@@ -984,7 +1003,7 @@ async function handleV1ChatCompletions(request: Request, env: Env, ctx: Executio
 
 						const keepAliveStream = new ReadableStream({
 							async start(controller) {
-								let keepAliveTimer: number | undefined = undefined;
+								let keepAliveTimer: any | undefined = undefined;
 								let isCancelled = false;
 
 								// Function to send keepalive chunks periodically
@@ -1143,14 +1162,14 @@ async function handleV1ChatCompletions(request: Request, env: Env, ctx: Executio
 					// --- NON-STREAMING MODE ---
 					else if (!stream) {
 						console.log("Processing successful response in NON-STREAMING mode.");
-						const geminiJson = await geminiResponse.json();
+						const geminiJson: any = await geminiResponse.json();
 						
 						// Check if it's an empty response (finishReason is OTHER and no content)
-						const isEmptyResponse = geminiJson.candidates && 
-											  geminiJson.candidates[0] && 
-											  geminiJson.candidates[0].finishReason === "OTHER" && 
-											  (!geminiJson.candidates[0].content || 
-											   !geminiJson.candidates[0].content.parts || 
+						const isEmptyResponse = geminiJson.candidates &&
+											  geminiJson.candidates[0] &&
+											  geminiJson.candidates[0].finishReason === "OTHER" &&
+											  (!geminiJson.candidates[0].content ||
+											   !geminiJson.candidates[0].content.parts ||
 											   geminiJson.candidates[0].content.parts.length === 0);
 						
 						if (isEmptyResponse && attempt < MAX_RETRIES) {
@@ -1276,7 +1295,7 @@ async function handleAdminGeminiModels(request: Request, env: Env, ctx: Executio
       return new Response(JSON.stringify([]), { headers });
     }
 
-    const data = await response.json();
+    const data: any = await response.json();
     // Process response - the structure is { models: [...] } as confirmed by user feedback
     const processedModels = (data.models || []).map((model: any) => {
       // Extract the model ID after "models/"
@@ -2006,8 +2025,8 @@ function decode(data: Uint8Array): string {
 /**
  * Converts ArrayBuffer to Base64 URL safe string.
  */
-function bufferToBase64Url(buffer: ArrayBuffer): string {
-	const bytes = new Uint8Array(buffer);
+function bufferToBase64Url(buffer: ArrayBuffer | Uint8Array): string {
+	const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
 	let binary = '';
 	bytes.forEach((byte) => {
 		binary += String.fromCharCode(byte);

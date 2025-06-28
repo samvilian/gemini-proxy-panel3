@@ -1,0 +1,9 @@
+fix(transform): Correctly handle tool messages by parsing tool_call_id
+
+The previous implementation failed when processing `role: 'tool'` messages from an OpenAI client because it incorrectly tried to access `msg.name`, which is often undefined. The standard field is `tool_call_id`.
+
+This fix addresses the `Error: 'tool' message missing or empty 'name' field` by:
+1.  Reading `msg.tool_call_id` instead of `msg.name`.
+2.  Extracting the function name from the `tool_call_id` using a regex, matching the format generated elsewhere in the proxy.
+3.  Providing a fallback to `msg.name` for robustness.
+4.  Ensuring that string content from tool results is properly wrapped in an object for compatibility with the Gemini API.
