@@ -13,6 +13,26 @@ function parseDataUri(dataUri) {
 }
 
 /**
+ * 递归移除对象中的 additionalProperties 字段
+ * @param {object|array} obj 
+ * @returns {object|array}
+ */
+function stripAdditionalProperties(obj) {
+    if (Array.isArray(obj)) {
+        return obj.map(stripAdditionalProperties);
+    } else if (obj && typeof obj === 'object') {
+        const newObj = {};
+        for (const key in obj) {
+            if (key !== 'additionalProperties') {
+                newObj[key] = stripAdditionalProperties(obj[key]);
+            }
+        }
+        return newObj;
+    }
+    return obj;
+}
+
+/**
  * Transforms an OpenAI-compatible request body to the Gemini API format.
  * @param {object} requestBody - The OpenAI request body.
  * @param {string} [requestedModelId] - The specific model ID requested.
@@ -184,8 +204,11 @@ function transformOpenAiToGemini(requestBody, requestedModelId, isSafetyEnabled 
 		const functionDeclarations = openAiTools
 			.filter(tool => tool.type === 'function' && tool.function)
 			.map(tool => {
-                // Deep clone parameters to avoid modifying the original request object
-                const parameters = tool.function.parameters ? JSON.parse(JSON.stringify(tool.function.parameters)) : undefined;
+                // Deep clone parameters 并递归移除 additionalProperties
+                let parameters = tool.function.parameters ? JSON.parse(JSON.stringify(tool.function.parameters)) : undefined;
+                if (parameters) {
+                    parameters = stripAdditionalProperties(parameters);
+                }
                 // Remove the $schema field if it exists in the clone
                 if (parameters && parameters.$schema !== undefined) {
                     delete parameters.$schema;
