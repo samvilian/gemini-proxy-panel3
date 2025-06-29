@@ -278,6 +278,26 @@ function parseDataUri(dataUri: string): { mimeType: string; data: string } | nul
 	return { mimeType: match[1], data: match[2] };
 }
 
+/**
+ * 递归移除对象中的 additionalProperties 字段
+ * @param obj
+ * @returns
+ */
+function stripAdditionalProperties(obj: any): any {
+    if (Array.isArray(obj)) {
+        return obj.map(stripAdditionalProperties);
+    } else if (obj && typeof obj === 'object') {
+        const newObj: any = {};
+        for (const key in obj) {
+            if (key !== 'additionalProperties') {
+                newObj[key] = stripAdditionalProperties(obj[key]);
+            }
+        }
+        return newObj;
+    }
+    return obj;
+}
+
 // Helper to transform OpenAI request body parts (messages, tools) to Gemini format
 // Added requestedModelId and isSafetyEnabled parameters
 function transformOpenAiToGemini(requestBody: any, requestedModelId?: string, isSafetyEnabled?: boolean): { contents: any[]; systemInstruction?: any; tools?: any[] } {
@@ -424,12 +444,15 @@ function transformOpenAiToGemini(requestBody: any, requestedModelId?: string, is
 		const functionDeclarations = openAiTools
 			.filter(tool => tool.type === 'function' && tool.function)
 			.map(tool => {
-				// Create a copy of the parameters to avoid modifying the original request object
-				const parameters = tool.function.parameters ? { ...tool.function.parameters } : undefined;
-				// Remove the $schema field if it exists in the copy
+				// Deep clone parameters 并递归移除 additionalProperties
+				let parameters = tool.function.parameters ? JSON.parse(JSON.stringify(tool.function.parameters)) : undefined;
+				if (parameters) {
+					parameters = stripAdditionalProperties(parameters);
+				}
+				// Remove the $schema field if it exists in the clone
 				if (parameters && parameters.$schema !== undefined) {
 					delete parameters.$schema;
-					console.log(`Removed '$schema' from parameters for tool: ${tool.function.name}`); // Optional: Log removal
+					console.log(`Removed '$schema' from parameters for tool: ${tool.function.name}`);
 				}
 				return {
 					name: tool.function.name,
