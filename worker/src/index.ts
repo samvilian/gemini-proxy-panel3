@@ -76,43 +76,21 @@ function getTodayInLA(): string {
 
 
 export default {
-	// 处理定时任务，每30分钟执行一次数据同步
+	// The `scheduled` handler is no longer necessary as the kvSyncManager now writes directly to KV.
+	// We are keeping it here but commenting it out in case scheduled tasks are needed in the future.
+	/*
 	async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-		console.log('[Scheduled] 执行定时KV同步任务');
-		
-		// 初始化KV命名空间
-		const geminiKV = env.GEMINI_KEYS_KV;
-		const workerConfigKV = env.WORKER_CONFIG_KV;
-		
-		// 添加绑定名称以帮助命名空间识别
-		(geminiKV as any).__BINDING_NAME = "GEMINI_KEYS_KV";
-		(workerConfigKV as any).__BINDING_NAME = "WORKER_CONFIG_KV";
-		
-		// 注册命名空间
-		kvSyncManager.registerNamespace(geminiKV);
-		kvSyncManager.registerNamespace(workerConfigKV);
-		
-		// 强制执行同步，确保所有内存中的数据被写入KV
-		await kvSyncManager.forceSyncAll();
-		
-		console.log('[Scheduled] 定时KV同步任务完成');
+		console.log('[Scheduled]任务触发。当前为无操作模式。');
+		// Example of a future scheduled task:
+		// await cleanupOldData(env.GEMINI_KEYS_KV);
 	},
+	*/
 
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
 		const pathname = url.pathname;
 
-		// 初始化KV命名空间 - 使用固定的命名空间名称而不是随机ID
-		const geminiKV = env.GEMINI_KEYS_KV;
-		const workerConfigKV = env.WORKER_CONFIG_KV;
-		
-		// 添加绑定名称以帮助命名空间识别
-		(geminiKV as any).__BINDING_NAME = "GEMINI_KEYS_KV";
-		(workerConfigKV as any).__BINDING_NAME = "WORKER_CONFIG_KV";
-		
-		// 注册命名空间
-		kvSyncManager.registerNamespace(geminiKV);
-		kvSyncManager.registerNamespace(workerConfigKV);
+		// The kvSyncManager is now stateless, so we no longer need to register namespaces.
 
 		try {
 			// API endpoint for OpenAI compatibility
@@ -541,7 +519,7 @@ function transformGeminiStreamChunk(geminiChunk: any, modelId: string): string |
 			return null;
 		}
 
-		const openaiChunk = {
+		const openaiChunk: any = {
 			id: `chatcmpl-${Date.now()}`,
 			object: "chat.completion.chunk",
 			created: Math.floor(Date.now() / 1000),
@@ -555,6 +533,11 @@ function transformGeminiStreamChunk(geminiChunk: any, modelId: string): string |
 				},
 			],
 		};
+
+		// --- New: Include Chain of Thought if present in the stream ---
+		if (candidate.chain_of_thought) {
+			openaiChunk.chain_of_thought = candidate.chain_of_thought;
+		}
 
 		return `data: ${JSON.stringify(openaiChunk)}\n\n`;
 
@@ -726,7 +709,9 @@ function transformGeminiResponseToOpenAIObject(geminiResponse: any, modelId: str
 			],
 			usage: usage,
 			// Include prompt feedback if available
-			...(geminiResponse.promptFeedback && { prompt_feedback: geminiResponse.promptFeedback })
+			...(geminiResponse.promptFeedback && { prompt_feedback: geminiResponse.promptFeedback }),
+			// --- New: Include Chain of Thought if present ---
+			...(candidate.chain_of_thought && { chain_of_thought: candidate.chain_of_thought })
 		};
 		// Return the object directly
 		return openaiResponse;
@@ -758,11 +743,14 @@ async function handleV1ChatCompletions(request: Request, env: Env, ctx: Executio
 	let stream: boolean = false;
 	let workerApiKey: string | null = null;
 	const isKeepAliveEnabled = env.KEEPALIVE_ENABLED === 'true'; // Check keepalive env var
+	let useChainOfThought: boolean = false; // New flag for CoT
 
 	try {
 		requestBody = await request.json();
 		requestedModelId = requestBody?.model;
 		stream = requestBody?.stream ?? false;
+		// Check for the custom chain_of_thought parameter
+		useChainOfThought = requestBody?.chain_of_thought === true;
 	} catch (e) {
 		console.error("Failed to parse request body:", e);
 		return new Response(JSON.stringify({ error: "Invalid request body" }), { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders() } });
@@ -851,6 +839,15 @@ async function handleV1ChatCompletions(request: Request, env: Env, ctx: Executio
 		}
 		if (systemInstruction) geminiRequestBody.systemInstruction = systemInstruction;
 		if (geminiTools) geminiRequestBody.tools = geminiTools;
+		// --- New: Add tool_config for Chain of Thought ---
+		if (useChainOfThought) {
+			geminiRequestBody.tool_config = {
+				function_calling_config: {
+					mode: "ANY"
+				}
+			};
+			console.log("Chain of Thought mode enabled by adding tool_config.");
+		}
 
 
 		// --- Retry Loop ---
@@ -2410,11 +2407,11 @@ async function getNextAvailableGeminiKey(env: Env, ctx: ExecutionContext, reques
 			return null;
 		}
 
-		// Save the next index for future requests
-		ctx.waitUntil(kvSyncManager.setKV(env.GEMINI_KEYS_KV, KV_KEY_GEMINI_KEY_INDEX, currentIndex.toString()));
-		
-		// Save the selected key ID for potential exclusion in case of error handling
-		ctx.waitUntil(kvSyncManager.setKV(env.GEMINI_KEYS_KV, KV_KEY_LAST_USED_GEMINI_KEY_ID, selectedKeyId));
+		// Save the next index for future requests and the last used key ID
+		ctx.waitUntil(Promise.all([
+			kvSyncManager.setKV(env.GEMINI_KEYS_KV, KV_KEY_GEMINI_KEY_INDEX, currentIndex.toString()),
+			kvSyncManager.setKV(env.GEMINI_KEYS_KV, KV_KEY_LAST_USED_GEMINI_KEY_ID, selectedKeyId)
+		]));
 		
 		console.log(`Selected Gemini Key ID via sequential round-robin: ${selectedKeyId} (next index: ${currentIndex})`);
 
@@ -2498,8 +2495,9 @@ async function incrementKeyUsage(keyId: string, env: Env, modelId?: string, cate
 			categoryUsage: categoryUsage,
 			consecutive429Counts: consecutive429Counts, // Save the (potentially reset) 429 counts
 		};
-		// 使用 kvSyncManager 将更新后的信息写入 KV
-		await kvSyncManager.setKV(env.GEMINI_KEYS_KV, keyKvName, JSON.stringify(updatedKeyInfo));
+		// Use kvSyncManager to write the updated info directly to KV.
+		// No need to use waitUntil as setKV is now an immediate operation.
+		await kvSyncManager.setKV(env.GEMINI_KEYS_KV, keyKvName, updatedKeyInfo);
 		console.log(`Usage for key ${keyId} updated. Total: ${updatedKeyInfo.usage}, Date: ${updatedKeyInfo.usageDate}, Model: ${modelId} (${category}), Models: ${JSON.stringify(modelUsage)}, Categories: ${JSON.stringify(categoryUsage)}, 429Counts: ${JSON.stringify(consecutive429Counts)}`);
 
 	} catch (e) {
@@ -2741,8 +2739,8 @@ async function recordKeyError(keyId: string, env: Env, status: 401 | 403): Promi
 		// Update the error status
 		keyInfoData.errorStatus = status;
 
-		// 使用 kvSyncManager 将错误状态写入 KV
-		await kvSyncManager.setKV(env.GEMINI_KEYS_KV, keyKvName, JSON.stringify(keyInfoData));
+		// Use kvSyncManager to write the error status directly to KV.
+		await kvSyncManager.setKV(env.GEMINI_KEYS_KV, keyKvName, keyInfoData);
 		console.log(`Recorded error status ${status} for key ${keyId}.`);
 
 	} catch (e) {

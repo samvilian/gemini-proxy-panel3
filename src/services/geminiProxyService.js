@@ -17,7 +17,7 @@ const PROJECT_ID_REGEX = /^[0-9a-f]{32}$/i;
 // Default Cloudflare Gateway project ID (Replace with your actual default if needed)
 const DEFAULT_PROJECT_ID = 'db16589aa22233d56fe69a2c3161fe3c';
 
-async function proxyChatCompletions(openAIRequestBody, workerApiKey, stream, thinkingBudget) {
+async function proxyChatCompletions(openAIRequestBody, workerApiKey, stream, thinkingBudget, returnThoughtProcess) {
     // Check if KEEPALIVE mode is enabled
     const keepAliveEnabled = process.env.KEEPALIVE === '1';
     
@@ -114,6 +114,18 @@ async function proxyChatCompletions(openAIRequestBody, workerApiKey, stream, thi
                     ...(geminiTools && { tools: geminiTools }),
                     ...(systemInstruction && { systemInstruction: systemInstruction }),
                 };
+
+                if (returnThoughtProcess) {
+                    console.log("Enabling thought process for this request.");
+                    // Ensure tool_config and thinking_config exist
+                    if (!geminiRequestBody.tool_config) {
+                        geminiRequestBody.tool_config = {};
+                    }
+                    geminiRequestBody.tool_config.thinking_config = {
+                        thinking_mode: "INCLUDE",
+                        placeholder: "(Thinking...)"
+                    };
+                }
 
                 if (openAIRequestBody.web_search === 1 || isSearchModel) {
                     console.log(`Web search enabled for this request (${isSearchModel ? 'model-based' : 'parameter-based'})`);

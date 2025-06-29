@@ -237,21 +237,43 @@ function transformOpenAiToGemini(requestBody, requestedModelId, isSafetyEnabled 
  * @returns {string | null} An OpenAI SSE data line string ("data: {...}\n\n") or null if chunk is empty/invalid.
  */
 function transformGeminiStreamChunk(geminiChunk, modelId) {
-	try {
-		if (!geminiChunk || !geminiChunk.candidates || !geminiChunk.candidates.length) {
-            // Ignore chunks that only contain usageMetadata (often appear at the end)
+    try {
+        if (!geminiChunk || !geminiChunk.candidates || !geminiChunk.candidates.length) {
             if (geminiChunk?.usageMetadata) {
                 return null;
             }
-			console.warn("Received empty or invalid Gemini stream chunk:", JSON.stringify(geminiChunk));
-			return null; // Skip empty/invalid chunks
-		}
+            console.warn("Received empty or invalid Gemini stream chunk:", JSON.stringify(geminiChunk));
+            return null;
+        }
 
-		const candidate = geminiChunk.candidates[0];
-		let contentText = null;
-		let toolCalls = undefined;
+        const candidate = geminiChunk.candidates[0];
+        let sseEvents = []; // Array to hold all SSE event strings to be returned
 
-		// Extract text content and function calls
+        // --- Part 1: Handle 'thought' parts as custom SSE events ---
+        if (candidate.content?.parts?.length > 0) {
+            const thoughtParts = candidate.content.parts.filter((part) => part.thought !== undefined);
+            if (thoughtParts.length > 0) {
+                thoughtParts.forEach(part => {
+                    const thought = part.thought;
+                    let thoughtEventData;
+                    if (thought.toolCode) {
+                        thoughtEventData = { type: 'tool_code', content: thought.toolCode };
+                    } else if (thought.placeholder !== undefined) { // Check for placeholder existence
+                        thoughtEventData = { type: 'placeholder' };
+                    }
+                    
+                    if (thoughtEventData) {
+                        const eventString = `event: thought_process\ndata: ${JSON.stringify(thoughtEventData)}\n\n`;
+                        sseEvents.push(eventString);
+                    }
+                });
+            }
+        }
+
+        // --- Part 2: Handle 'text' and 'functionCall' parts as standard OpenAI chunks ---
+        let contentText = null;
+        let toolCalls = undefined;
+
         if (candidate.content?.parts?.length > 0) {
             const textParts = candidate.content.parts.filter((part) => part.text !== undefined);
             const functionCallParts = candidate.content.parts.filter((part) => part.functionCall !== undefined);
@@ -261,84 +283,68 @@ function transformGeminiStreamChunk(geminiChunk, modelId) {
             }
 
             if (functionCallParts.length > 0) {
-                // Generate unique IDs for tool calls within the stream context if needed,
-                // or use a simpler identifier if absolute uniqueness isn't critical across chunks.
                 toolCalls = functionCallParts.map((part, index) => ({
-                    index: index, // Gemini doesn't provide a stable index in stream AFAIK, use loop index
-                    id: `call_${part.functionCall.name}_${Date.now()}_${index}`, // Example ID generation
+                    index: index,
+                    id: `call_${part.functionCall.name}_${Date.now()}_${index}`,
                     type: "function",
                     function: {
                         name: part.functionCall.name,
-                        // Arguments in Gemini stream might be partial JSON, attempt to stringify
                         arguments: JSON.stringify(part.functionCall.args || {}),
                     },
                 }));
             }
         }
 
-		// Determine finish reason mapping
-		let finishReason = candidate.finishReason;
+        let finishReason = candidate.finishReason;
         if (finishReason === "STOP") finishReason = "stop";
         else if (finishReason === "MAX_TOKENS") finishReason = "length";
         else if (finishReason === "SAFETY" || finishReason === "RECITATION") finishReason = "content_filter";
         else if (finishReason === "TOOL_CALLS" || (toolCalls && toolCalls.length > 0 && finishReason !== 'stop' && finishReason !== 'length')) {
-            // If there are tool calls and the reason isn't stop/length, map it to tool_calls
             finishReason = "tool_calls";
         } else if (finishReason && finishReason !== "FINISH_REASON_UNSPECIFIED" && finishReason !== "OTHER") {
-            // Keep known reasons like 'stop', 'length', 'content_filter'
+            // Keep known reasons
         } else {
-            finishReason = null; // Map unspecified/other/null to null
+            finishReason = null;
         }
 
-
-		// Construct the delta part for the OpenAI chunk
-		const delta = {};
-        // Include role only if there's actual content or tool calls in this chunk
+        const delta = {};
         if (candidate.content?.role && (contentText !== null || (toolCalls && toolCalls.length > 0))) {
             delta.role = candidate.content.role === 'model' ? 'assistant' : candidate.content.role;
         }
 
         if (toolCalls && toolCalls.length > 0) {
             delta.tool_calls = toolCalls;
-             // IMPORTANT: Explicitly set content to null if there are tool_calls but no text content in THIS chunk
-             // This aligns with OpenAI's behavior where a chunk might contain only tool_calls.
             if (contentText === null) {
                 delta.content = null;
             } else {
-                 delta.content = contentText; // Include text if it also exists
+                 delta.content = contentText;
             }
         } else if (contentText !== null) {
-             // Only include content if there's text and no tool calls in this chunk
             delta.content = contentText;
         }
 
+        if (Object.keys(delta).length > 0 || finishReason) {
+            const openaiChunk = {
+                id: `chatcmpl-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`,
+                object: "chat.completion.chunk",
+                created: Math.floor(Date.now() / 1000),
+                model: modelId,
+                choices: [
+                    {
+                        index: candidate.index || 0,
+                        delta: delta,
+                        finish_reason: finishReason,
+                        logprobs: null,
+                    },
+                ],
+            };
+            sseEvents.push(`data: ${JSON.stringify(openaiChunk)}\n\n`);
+        }
 
-		// Only create a chunk if there's something meaningful to send
-		if (Object.keys(delta).length === 0 && !finishReason) {
-			return null;
-		}
+        return sseEvents.length > 0 ? sseEvents.join('') : null;
 
-		const openaiChunk = {
-			id: `chatcmpl-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`, // More unique ID
-			object: "chat.completion.chunk",
-			created: Math.floor(Date.now() / 1000),
-			model: modelId,
-			choices: [
-				{
-					index: candidate.index || 0,
-					delta: delta,
-					finish_reason: finishReason, // Use the mapped finishReason
-                    logprobs: null, // Not provided by Gemini
-				},
-			],
-            // Usage is typically not included in stream chunks, only at the end if at all
-		};
-
-		return `data: ${JSON.stringify(openaiChunk)}\n\n`;
-
-	} catch (e) {
-		console.error("Error transforming Gemini stream chunk:", e, "Chunk:", JSON.stringify(geminiChunk));
-        // Optionally return an error chunk
+    } catch (e) {
+        console.error("Error transforming Gemini stream chunk:", e, "Chunk:", JSON.stringify(geminiChunk));
         const errorChunk = {
             id: `chatcmpl-error-${Date.now()}`,
             object: "chat.completion.chunk",
@@ -347,7 +353,7 @@ function transformGeminiStreamChunk(geminiChunk, modelId) {
             choices: [{ index: 0, delta: { content: `[Error transforming chunk: ${e.message}]` }, finish_reason: 'error' }]
         };
         return `data: ${JSON.stringify(errorChunk)}\n\n`;
-	}
+    }
 }
 
 
@@ -358,22 +364,19 @@ function transformGeminiStreamChunk(geminiChunk, modelId) {
  * @returns {string} A JSON string representing the OpenAI-compatible response.
  */
 function transformGeminiResponseToOpenAI(geminiResponse, modelId) {
-	try {
-        // Handle cases where the response indicates an error (e.g., blocked prompt)
+    try {
         if (!geminiResponse.candidates || geminiResponse.candidates.length === 0) {
             let errorMessage = "Gemini response missing candidates.";
-            let finishReason = "error"; // Default error finish reason
+            let finishReason = "error";
 
-            // Check for prompt feedback indicating blocking
             if (geminiResponse.promptFeedback?.blockReason) {
                 errorMessage = `Request blocked by Gemini: ${geminiResponse.promptFeedback.blockReason}.`;
-                finishReason = "content_filter"; // More specific finish reason
+                finishReason = "content_filter";
                  console.warn(`Gemini request blocked: ${geminiResponse.promptFeedback.blockReason}`, JSON.stringify(geminiResponse.promptFeedback));
             } else {
                 console.error("Invalid Gemini response structure:", JSON.stringify(geminiResponse));
             }
 
-            // Construct an error response in OpenAI format
             const errorResponse = {
                 id: `chatcmpl-error-${Date.now()}`,
                 object: "chat.completion",
@@ -390,13 +393,25 @@ function transformGeminiResponseToOpenAI(geminiResponse, modelId) {
             return JSON.stringify(errorResponse);
         }
 
+        const candidate = geminiResponse.candidates[0];
+        let contentText = null;
+        let toolCalls = undefined;
+        let thoughtProcess = [];
 
-		const candidate = geminiResponse.candidates[0];
-		let contentText = null;
-		let toolCalls = undefined;
+        if (candidate.content?.parts?.length > 0) {
+            const thoughtParts = candidate.content.parts.filter((part) => part.thought !== undefined);
+            if (thoughtParts.length > 0) {
+                thoughtProcess = thoughtParts.map(part => {
+                    const thought = part.thought;
+                    if (thought.toolCode) {
+                        return { type: 'tool_code', content: thought.toolCode };
+                    } else if (thought.placeholder !== undefined) {
+                        return { type: 'placeholder' };
+                    }
+                    return null;
+                }).filter(t => t !== null);
+            }
 
-		// Extract content and tool calls
-		if (candidate.content?.parts?.length > 0) {
             const textParts = candidate.content.parts.filter((part) => part.text !== undefined);
             const functionCallParts = candidate.content.parts.filter((part) => part.functionCall !== undefined);
 
@@ -406,105 +421,95 @@ function transformGeminiResponseToOpenAI(geminiResponse, modelId) {
 
             if (functionCallParts.length > 0) {
                 toolCalls = functionCallParts.map((part, index) => ({
-                    id: `call_${part.functionCall.name}_${Date.now()}_${index}`, // Example ID
+                    id: `call_${part.functionCall.name}_${Date.now()}_${index}`,
                     type: "function",
                     function: {
                         name: part.functionCall.name,
-                        // Arguments should be a stringified JSON in OpenAI format
                         arguments: JSON.stringify(part.functionCall.args || {}),
                     },
                 }));
             }
         }
 
-		// Map finish reason
-		let finishReason = candidate.finishReason;
+        let finishReason = candidate.finishReason;
         if (finishReason === "STOP") finishReason = "stop";
         else if (finishReason === "MAX_TOKENS") finishReason = "length";
         else if (finishReason === "SAFETY" || finishReason === "RECITATION") finishReason = "content_filter";
-        else if (finishReason === "TOOL_CALLS") finishReason = "tool_calls"; // Explicitly check for TOOL_CALLS
+        else if (finishReason === "TOOL_CALLS") finishReason = "tool_calls";
         else if (toolCalls && toolCalls.length > 0) {
-             // If tools were called but reason is not TOOL_CALLS (e.g., STOP), still map to tool_calls
             finishReason = "tool_calls";
         } else if (finishReason && finishReason !== "FINISH_REASON_UNSPECIFIED" && finishReason !== "OTHER") {
             // Keep known reasons
         } else {
-             finishReason = null; // Map unspecified/other to null
+             finishReason = null;
         }
 
-        // Handle cases where content might be missing due to safety ratings, even if finishReason isn't SAFETY
         if (contentText === null && !toolCalls && candidate.finishReason === "SAFETY") {
              console.warn("Gemini response finished due to SAFETY, content might be missing.");
              contentText = "[Content blocked due to safety settings]";
              finishReason = "content_filter";
         } else if (candidate.finishReason === "RECITATION") {
              console.warn("Gemini response finished due to RECITATION.");
-             // contentText might exist but could be partial/problematic
-             finishReason = "content_filter"; // Map recitation to content_filter
+             finishReason = "content_filter";
         }
 
-
-		// Construct the OpenAI message object
-		const message = { role: "assistant" };
+        const message = { role: "assistant" };
         if (toolCalls && toolCalls.length > 0) {
              message.tool_calls = toolCalls;
-             // IMPORTANT: Set content to null if only tool calls exist, otherwise include text
              message.content = contentText !== null ? contentText : null;
         } else {
-             message.content = contentText; // Assign text content if no tool calls
+             message.content = contentText;
         }
-         // Ensure content is at least null if nothing else was generated
          if (message.content === undefined && !message.tool_calls) {
             message.content = null;
          }
 
+        const usage = {
+            prompt_tokens: geminiResponse.usageMetadata?.promptTokenCount || 0,
+            completion_tokens: geminiResponse.usageMetadata?.candidatesTokenCount || 0,
+            total_tokens: geminiResponse.usageMetadata?.totalTokenCount || 0,
+        };
 
-		// Map usage metadata
-		const usage = {
-			prompt_tokens: geminiResponse.usageMetadata?.promptTokenCount || 0,
-			completion_tokens: geminiResponse.usageMetadata?.candidatesTokenCount || 0, // Sum across candidates if multiple
-			total_tokens: geminiResponse.usageMetadata?.totalTokenCount || 0,
-		};
-
-		// Construct the final OpenAI response object
-		const openaiResponse = {
-			id: `chatcmpl-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`,
-			object: "chat.completion",
-			created: Math.floor(Date.now() / 1000),
-			model: modelId,
-			choices: [
-				{
-					index: candidate.index || 0,
-					message: message,
-					finish_reason: finishReason,
-                    logprobs: null, // Not provided by Gemini
-				},
-			],
-			usage: usage,
-            // Include system fingerprint if available (though Gemini doesn't provide one)
+        const openaiResponse = {
+            id: `chatcmpl-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`,
+            object: "chat.completion",
+            created: Math.floor(Date.now() / 1000),
+            model: modelId,
+            choices: [
+                {
+                    index: candidate.index || 0,
+                    message: message,
+                    finish_reason: finishReason,
+                    logprobs: null,
+                },
+            ],
+            usage: usage,
             system_fingerprint: null
-		};
+        };
 
-		return JSON.stringify(openaiResponse);
+        if (thoughtProcess.length > 0) {
+            openaiResponse.x_gemini_thought_process = thoughtProcess;
+        }
 
-	} catch (e) {
-		console.error("Error transforming Gemini non-stream response:", e, "Response:", JSON.stringify(geminiResponse));
-		// Return an error structure in OpenAI format
-		const errorResponse = {
-			id: `chatcmpl-error-${Date.now()}`,
-			object: "chat.completion",
-			created: Math.floor(Date.now() / 1000),
-			model: modelId,
-			choices: [{
-				index: 0,
-				message: { role: "assistant", content: `Error processing Gemini response: ${e.message}` },
-				finish_reason: "error",
+        return JSON.stringify(openaiResponse);
+
+    } catch (e) {
+        console.error("Error transforming Gemini non-stream response:", e, "Response:", JSON.stringify(geminiResponse));
+        const errorResponse = {
+            id: `chatcmpl-error-${Date.now()}`,
+            object: "chat.completion",
+            created: Math.floor(Date.now() / 1000),
+            model: modelId,
+            choices: [{
+                index: 0,
+                message: { role: "assistant", content: `Error processing Gemini response: ${e.message}` },
+                finish_reason: "error",
                 logprobs: null,
-			}],
-			usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-		};
-		return JSON.stringify(errorResponse);
-	}
+            }],
+            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        };
+        return JSON.stringify(errorResponse);
+    }
 }
 
 

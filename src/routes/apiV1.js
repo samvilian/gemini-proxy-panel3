@@ -85,6 +85,7 @@ router.post('/chat/completions', async (req, res, next) => {
     const openAIRequestBody = req.body;
     const workerApiKey = req.workerApiKey; // Attached by requireWorkerAuth middleware
     const stream = openAIRequestBody?.stream ?? false;
+    const returnThoughtProcess = openAIRequestBody?.return_thought_process ?? false;
     const requestedModelId = openAIRequestBody?.model; // Keep track for transformations
     
     try {
@@ -118,7 +119,8 @@ router.post('/chat/completions', async (req, res, next) => {
                 openAIRequestBody,
                 workerApiKey,
                 stream,
-                thinkingBudget
+                thinkingBudget,
+                returnThoughtProcess
             );
         }
 
@@ -428,21 +430,16 @@ router.post('/chat/completions', async (req, res, next) => {
             // Process a single Gemini API response object and convert it to OpenAI format
             function processGeminiObject(geminiObj, stream) {
                 if (!geminiObj) return;
-                
-                // If it's a valid Gemini response object (contains candidates)
-                if (geminiObj.candidates && geminiObj.candidates.length > 0) {
-                    // Convert and send directly
-                    const openaiChunkStr = transformUtils.transformGeminiStreamChunk(geminiObj, requestedModelId);
-                    if (openaiChunkStr) {
-                        stream.push(openaiChunkStr);
-                    }
-                } else if (Array.isArray(geminiObj)) {
-                    // If it's an array, process each element
-                    for (const item of geminiObj) {
-                        processGeminiObject(item, stream);
+
+                // If it's a valid Gemini response object (contains candidates or is an array)
+                if ((geminiObj.candidates && geminiObj.candidates.length > 0) || Array.isArray(geminiObj)) {
+                    // The transformation function now returns a string of one or more SSE events
+                    const sseEventsString = transformUtils.transformGeminiStreamChunk(geminiObj, requestedModelId);
+                    if (sseEventsString) {
+                        stream.push(sseEventsString);
                     }
                 } else if (geminiObj.text) {
-                    // Single text fragment, construct Gemini format
+                    // Handle single text fragment for robustness
                     const mockGeminiChunk = {
                         candidates: [{
                             content: {
@@ -451,10 +448,9 @@ router.post('/chat/completions', async (req, res, next) => {
                             }
                         }]
                     };
-                    
-                    const openaiChunkStr = transformUtils.transformGeminiStreamChunk(mockGeminiChunk, requestedModelId);
-                    if (openaiChunkStr) {
-                        stream.push(openaiChunkStr);
+                    const sseEventsString = transformUtils.transformGeminiStreamChunk(mockGeminiChunk, requestedModelId);
+                    if (sseEventsString) {
+                        stream.push(sseEventsString);
                     }
                 }
                 // May need to handle other response types...
