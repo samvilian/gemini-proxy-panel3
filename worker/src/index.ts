@@ -462,13 +462,19 @@ function transformGeminiStreamChunk(geminiChunk: any, modelId: string): string |
 		const candidate = geminiChunk.candidates[0];
 		let contentText: string | null = null;
 		let toolCalls: any[] | undefined = undefined;
+		let chainOfThought: any[] = [];
 
 		if (candidate.content?.parts?.length > 0) {
 			const textParts = candidate.content.parts.filter((part: any) => part.text !== undefined);
 			const functionCallParts = candidate.content.parts.filter((part: any) => part.functionCall !== undefined);
+			const toolCodeParts = candidate.content.parts.filter((part: any) => part.tool_code !== undefined);
 
 			if (textParts.length > 0) {
 				contentText = textParts.map((part: any) => part.text).join("");
+			}
+			
+			if (toolCodeParts.length > 0) {
+				chainOfThought = toolCodeParts.map((part: any) => part.tool_code);
 			}
 
 			if (functionCallParts.length > 0) {
@@ -535,8 +541,8 @@ function transformGeminiStreamChunk(geminiChunk: any, modelId: string): string |
 		};
 
 		// --- New: Include Chain of Thought if present in the stream ---
-		if (candidate.chain_of_thought) {
-			openaiChunk.chain_of_thought = candidate.chain_of_thought;
+		if (chainOfThought.length > 0) {
+			openaiChunk.chain_of_thought = chainOfThought;
 		}
 
 		return `data: ${JSON.stringify(openaiChunk)}\n\n`;
@@ -644,13 +650,19 @@ function transformGeminiResponseToOpenAIObject(geminiResponse: any, modelId: str
 
 		let contentText: string | null = null;
 		let toolCalls: any[] | undefined = undefined;
+		let chainOfThought: any[] = [];
 
 		if (candidate.content?.parts?.length > 0) {
 			const textParts = candidate.content.parts.filter((part: any) => part.text !== undefined);
 			const functionCallParts = candidate.content.parts.filter((part: any) => part.functionCall !== undefined);
+			const toolCodeParts = candidate.content.parts.filter((part: any) => part.tool_code !== undefined);
 
 			if (textParts.length > 0) {
 				contentText = textParts.map((part: any) => part.text).join("");
+			}
+
+			if (toolCodeParts.length > 0) {
+				chainOfThought = toolCodeParts.map((part: any) => part.tool_code);
 			}
 
 			if (functionCallParts.length > 0) {
@@ -711,7 +723,7 @@ function transformGeminiResponseToOpenAIObject(geminiResponse: any, modelId: str
 			// Include prompt feedback if available
 			...(geminiResponse.promptFeedback && { prompt_feedback: geminiResponse.promptFeedback }),
 			// --- New: Include Chain of Thought if present ---
-			...(candidate.chain_of_thought && { chain_of_thought: candidate.chain_of_thought })
+			...(chainOfThought.length > 0 && { chain_of_thought: chainOfThought })
 		};
 		// Return the object directly
 		return openaiResponse;
